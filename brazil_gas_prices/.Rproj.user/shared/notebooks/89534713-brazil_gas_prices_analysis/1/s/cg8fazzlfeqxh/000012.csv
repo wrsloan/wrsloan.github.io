@@ -1,0 +1,5 @@
+"0","post_2013 <- post_2013 %>%"
+"0","  select(final_date, region, state, Diesel_S10) %>%"
+"0","  arrange(!is.na(Diesel_S10)) %>%"
+"0","  rename('Date' = 'final_date', 'Region' = 'region', 'State' = 'state', 'Diesel S10 Price' = 'Diesel_S10')"
+"0","datatable(head(post_2013, 100))"

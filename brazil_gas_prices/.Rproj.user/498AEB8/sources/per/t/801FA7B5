@@ -1,0 +1,26 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1563832717277.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "670888863",
+    "id" : "801FA7B5",
+    "lastKnownWriteTime" : 1565559303,
+    "last_content_update" : 1565559303910,
+    "path" : "~/Desktop/Data_Science/Projects/brazil_gas_prices/bgp_data_cleaning.R",
+    "project_path" : "bgp_data_cleaning.R",
+    "properties" : {
+        "cursorPosition" : "340,30",
+        "scrollLine" : "0",
+        "tempName" : "Untitled1"
+    },
+    "read_only" : false,
+    "read_only_alternatives" : [
+    ],
+    "relative_order" : 2,
+    "source_on_save" : true,
+    "source_window" : "",
+    "type" : "r_source"
+}

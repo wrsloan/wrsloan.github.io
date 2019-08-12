@@ -1,0 +1,6 @@
+"0","# ethanol"
+"0","eth_NAs <- checkNAs %>%"
+"0","  select(final_date, region, state, Ethanol) %>%"
+"0","  arrange(!is.na(Ethanol)) %>%"
+"0","  rename('Date' = 'final_date', 'Region' = 'region', 'State' = 'state', 'Ethanol Price' = 'Ethanol')"
+"0","datatable(head(eth_NAs, 100))"

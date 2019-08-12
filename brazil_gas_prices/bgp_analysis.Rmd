@@ -1,0 +1,526 @@
+---
+title: "Gas Prices in Brazil"
+author: Billy Sloan
+runtime: shiny
+output: html_document
+---
+The report will be structured as follows.  First, Section I introduces the datasets and provides a brief geographic understanding of Brazil.  Section II then walks through the data wrangling necessary to complete the analysis.  Next, Section III illustrates fuel price behavior dynamically; highlighting the recurring ethanol supply shortages, the Petrobras scandal and resulting 2014-2016 economic crisis, and concluding with the 2017 fuel tax increase.  Lastly, Section IV models fuel prices using a bootstrapped linear regression and a generalized linear model with penalized maximum likelihood.
+
+## I. Introduction
+### A. Data Description
+In this study, I examine the behavior of Brazil's fuel prices ranging from May 9, 2004 - June 1, 2019.  The primary dataset used is provided by The National Agency of Petroleum, Natural Gas, and Bio Fuels (ANP), and can be found [here](https://www.kaggle.com/matheusfreitag/gas-prices-in-brazil).  It includes the minimum, maximum, and mean price of six separate fuel types measured over a one week span, distinguishable by region and state.  This research focuses on the price dynamics of common gas, ethanol, diesel, and diesel S10, all of which are measured in reals per liter (R$/l). Note diesel S10 was not available on the market until January 2013.  It was introduced as a less volatile, more fuel efficient form of diesel, intended for truckers traveling long distances.  Hence, it is priced at a premium, with price fluctuations between the two remaining parallel.  
+
+In addition, I import data on international oil prices (both WTI and Brent), Brazilian GDP, Chinese GDP, international sugar prices, and Petrobras stock prices (Brazil's largest petroleum company).  International oil prices, Brazilian GDP, and Chinese GDP are gathered from [FRED](https://fred.stlouisfed.org/), while international sugar and Petrobras stock prices are obtained from [Macrotrends](https://www.macrotrends.net/2537/sugar-prices-historical-chart-data) and [Yahoo! Finance](https://finance.yahoo.com/quote/PBR/history?p=PBR), respectively. These datasets will be utilized in Section IV.
+
+### B. Region Synopsis
+Brazil is divided into five regions; North, Northeast, Central-West, Southeast, and South.  The North consists of seven states, with the majority of its land being covered by the Amazon Rainforest. Hence, the North has the lowest population density and least paved highways of all regions.  The Northeast is divided into nine states, having a fair number of highways and being the most impoverished of all regions.  The Central-West, much like the North, has a low population density in addition to relatively few highways.  The region is comprised of three states, with land being predominantly used for livestock grazing.  The Southeast contributes greatest to the Brazilian economy, being responsible for approximately half of the country's GDP in addition to 75% of the country's petroleum production.  The region is highly populated, with São Paulo and Rio de Janeiro acting as meccas for both business and tourism. Furthermore, the Southeast is known for its large number of highways as well as being the country's center for air travel.  The South is split into three states, having many highways and being the most urbanized of all regions.  Relative number of highways serves as an adequate proxy for fuel demand, as all observations are taken from land-vehicle based fuel stations.  However, one should also consider fuel transport costs when making price predictions.  With the majority of petroleum production taking place in the South, further regions likely have to pay a premium for gasoline and diesel delivery (i.e. the North, Northeast).  Similarly, ethanol production is centered in the Central-West and Southeast (~90%), with the Northeast accounting for the remaining 10%.
+
+## II. Data Wrangling
+```{r}
+# packages needed
+library(tidyverse)
+library(gridExtra)
+library(viridis)
+library(lubridate)
+library(date)
+library(scales)
+library(data.table)
+library(fastDummies)
+library(caret)
+library(glmnet)
+library(tools)
+library(knitr)
+library(DT)
+library(shiny)
+```
+### A. Brazil Fuel Prices
+First, I import Brazil's historical fuel prices.
+```{r}
+# Read in dataframe
+df <- read.table('brazil_gas_prices.tsv', sep = '\t', header = TRUE)
+
+# Translate column labels
+df <- df %>%
+  rename(
+    'initial_date'    = DATA.INICIAL,
+    'final_date'      = DATA.FINAL,
+    'region'          = REGIÃO,
+    'state'           = ESTADO,
+    'product'         = PRODUTO,
+    'n_stations'      = NÚMERO.DE.POSTOS.PESQUISADOS,
+    'measurement'     = UNIDADE.DE.MEDIDA,
+    'mean_price'      = PREÇO.MÉDIO.REVENDA,
+    'month'           = MÊS,
+    'year'            = ANO
+  )
+
+# Translate region/fuel type
+df <- df %>%
+  select(initial_date, final_date, region, state, product, measurement,
+         mean_price, month, year) %>%
+  mutate(region = fct_recode(region,
+    'Central-West'   = 'CENTRO OESTE',
+    'Northeast' = 'NORDESTE',
+    'North'     = 'NORTE',
+    'Southeast' = 'SUDESTE',
+    'South'     = 'SUL')) %>%
+  mutate(product = fct_recode(product,
+    'Common Gas'  = 'GASOLINA COMUM',
+    'Diesel'      = 'ÓLEO DIESEL',
+    'Ethanol'     = 'ETANOL HIDRATADO',
+    'Diesel S10'  = 'ÓLEO DIESEL S10')) %>%
+  # Analysis will focus on common gas, diesel, diesel s10, and ethanol
+  mutate(final_date = as.Date(final_date)) %>%
+  filter(product != 'GNV', product != 'GLP', final_date <= '2019-06-01' )
+
+# Convert states from all caps to title case
+df$state <- tolower(df$state)
+df$state <- toTitleCase(df$state)
+```
+
+Next, I check for explicit and implicit NA values in fuel prices.  I find no missing observations explicitly in the data.  However, I find 88 implicit NAs for ethanol, and four for diesel S10.
+```{r}
+# explicit NAs
+sum(is.na(df$mean_price))
+
+checkNAs <- df %>%
+  select(final_date, year, month, mean_price, product, region, state) %>%
+  group_by(product, region, state) %>%
+  spread(product, mean_price) %>%
+  rename('Common_Gas' = 'Common Gas', 'Diesel_S10'= 'Diesel S10')
+
+# implicit ethanol NAs
+sum(is.na(checkNAs$Ethanol))
+# implicit common gas NAs
+sum(is.na(checkNAs$Common_Gas))
+# implicit diesel NAs
+sum(is.na(checkNAs$Diesel))
+
+post_2013 <- checkNAs %>%
+  filter(year >= 2013)
+# implicit diesel S10 NAs
+sum(is.na(post_2013$Diesel_S10))
+```
+
+
+Missing Observations: Ethanol
+-----------------------------
+```{r, echo = FALSE}
+# ethanol
+eth_NAs <- checkNAs %>%
+  select(final_date, region, state, Ethanol) %>%
+  arrange(!is.na(Ethanol)) %>%
+  rename('Date' = 'final_date', 'Region' = 'region', 'State' = 'state', 'Ethanol Price' = 'Ethanol')
+datatable(head(eth_NAs, 100))
+```
+
+
+Missing Observations: Diesel S10
+--------------------------------
+```{r, echo = FALSE}
+post_2013 <- post_2013 %>%
+  select(final_date, region, state, Diesel_S10) %>%
+  arrange(!is.na(Diesel_S10)) %>%
+  rename('Date' = 'final_date', 'Region' = 'region', 'State' = 'state', 'Diesel S10 Price' = 'Diesel_S10')
+datatable(head(post_2013, 100))
+```
+Amapa (North) accounts for the majority of ethanol NAs, most of which appear post-2015.  All four diesel S10 NAs appear in the beginning of January 2013, likely as a result of some states introducing the fuel later than others.  However, note Acre (North) has a diesel S10 price for 1/12/13, but not 1/19/13.  One can assume the price was somewhere in the proximity of R\$2.64/l (1/12/13) and R\$2.59/l (1/26/13).
+
+### B. Remaining Data
+International oil, international sugar, and Petrobras stock are priced daily, with Brazilian and Chinese GDP being reported monthly.  To coincide with weekly fuel prices, the daily data is averaged by week before being merged, with the monthly data being merged via corresponding year and month.  Note that daily prices on market holidays are denoted as a period (.), and are removed before calculating weekly averages.
+```{r}
+# Import crude oil prices
+# WTI
+wti <- read.csv('wti_prices.csv', header = TRUE)
+wti <- wti %>%
+  rename('date' = DATE, 'wti_price' = DCOILWTICO) %>%
+  filter(wti_price != '.') %>%
+  mutate(date = as.Date(date, format = '%Y-%m-%d'), week = floor_date(date, 'week'),
+         wti_price = as.numeric(as.character(wti_price)))
+# Mean prices by week
+wti <- aggregate(wti_price ~ week, FUN = mean, data = wti)
+wti <- wti %>%
+  rename('final_date' = 'week') %>%
+  # Change date from beg to end of week
+  mutate(final_date = as.Date(final_date, format = '%Y-%m-%d'), final_date = final_date + 6)
+
+# Brent
+brent <- read.csv('brent_prices.csv', header = TRUE)
+brent <- brent %>%
+  rename('date' = DATE, 'brent_price' = DCOILBRENTEU) %>%
+  filter(brent_price != '.') %>%
+  mutate(date = as.Date(date, format = '%Y-%m-%d'), week = floor_date(date, 'week'),
+         brent_price = as.numeric(as.character(brent_price)))
+# Mean prices by week
+brent <- aggregate(brent_price ~ week, FUN = mean, data = brent)
+brent <- brent %>%
+  rename('final_date' = 'week') %>%
+  # Change date from beg to end of week
+  mutate(final_date = as.Date(final_date, format = '%Y-%m-%d'), final_date = final_date + 6)
+
+# Import sugar prices
+sugar <- read.csv('sugar_prices.csv', header = TRUE)
+sugar <- sugar %>%
+  rename('daily_price' = 'value') %>%
+  filter(as.Date(date) >= '2004-05-10' & as.Date(date) <= '2019-06-01') %>%
+  mutate(date = as.Date(date, format = '%Y-%m-%d'), week = floor_date(date, 'week'))
+# Mean prices by week
+sugar <-  aggregate(daily_price ~ week, FUN = mean, data = sugar)
+sugar <- sugar %>%
+  rename('final_date' = 'week', 'sugar_price' = 'daily_price') %>%
+  # Change date from beg to end of week
+  mutate(final_date = as.Date(final_date, format = '%Y-%m-%d'), final_date = final_date + 6)
+
+# Import Petrobras stock prices
+petrobras <- read.csv('PBR.csv', header = TRUE)
+petrobras <- petrobras %>%
+  select(Date, Open) %>%
+  rename('date' = Date, 'stock_price' = Open) %>%
+  filter(as.Date(date) >= '2004-05-10' & as.Date(date) <= '2019-06-01') %>%
+  mutate(date = as.Date(date, format = '%Y-%m-%d'), week = floor_date(date, 'week'),
+         stock_price = as.numeric(as.character(stock_price)))
+# Mean prices by week
+petrobras <- aggregate(stock_price ~ week, FUN = mean, data = petrobras)
+petrobras <- petrobras %>%
+  rename('final_date' = 'week') %>%
+  # Change date from beg to end of week
+  mutate(final_date = as.Date(final_date, format = '%Y-%m-%d'), final_date = final_date + 6)
+
+# Import Brazil GDP
+b_gdp <- read.csv('brazil_gdp.csv', header = TRUE)
+b_gdp <- b_gdp %>%
+  rename('date' = DATE, 'b_gdp' = BRALORSGPNOSTSAM) %>%
+  mutate(date = as.Date(date, format = '%Y-%m-%d')) %>%
+  filter(date >= '2004-05-01' & date <= '2019-05-01')
+
+# Import China GDP
+c_gdp <- read.csv('china_gdp.csv', header = TRUE)
+c_gdp <- c_gdp %>%
+  rename('date' = DATE, 'c_gdp' = CHNLORSGPNOSTSAM) %>%
+  mutate(date = as.Date(date, format = '%Y-%m-%d')) %>%
+  filter(date >= '2004-05-01' & date <= '2019-05-01')
+
+# Merge dataframes by dates for stock/oil prices, by month for gdp
+df$ym_date <- make_date(year = df$year, month = df$month)
+df$final_date <- as.Date(df$final_date, format = '%Y-%m-%d')
+
+df <- df %>%
+  left_join(b_gdp, by = c('ym_date' = 'date')) %>%
+  left_join(c_gdp, by = c('ym_date' = 'date')) %>%
+  left_join(petrobras, by = 'final_date') %>%
+  left_join(wti, by = 'final_date') %>%
+  left_join(brent, by = 'final_date') %>%
+  left_join(sugar, by = 'final_date')
+```
+
+
+## III. Exploratory Data Analysis
+The following functions are used in visualizing fuel price dynamics.  The first does so by fuel type, taking fuel type, initial year, and final year as arguments.  The second does so by fuel type and region, taking fuel type, initial year, and final year as arguments.  The last, using percent change, does so by fuel type and state, taking fuel type, region, initial date, and final date as arguments.
+```{r}
+# By fuel
+plot_byFuel <- function(fuel_type, beg_yr, end_yr) {
+  df %>%
+    select(final_date, year, month, mean_price, product, region, measurement) %>%
+    group_by(final_date, product, measurement) %>%
+    filter(product == fuel_type, between(year, beg_yr, end_yr)) %>%
+    mutate(price = mean(mean_price)) %>%
+    ggplot(aes(as.Date(final_date), price, color = price)) +
+    geom_line() +
+    scale_color_viridis(option = 'inferno') +
+    ggtitle(fuel_type) + xlab(NULL) + 
+    ylab(paste0('Price ', '(',df$measurement[df$product == fuel_type],')')) +
+    theme(legend.position = 'none')
+}
+
+# By region
+plot_byReg <- function(fuel_type, beg_yr, end_yr) {
+  df %>%
+    select(final_date, year, month, mean_price, product,
+           region, state, measurement) %>%
+    group_by(final_date, region) %>%
+    filter(product == fuel_type, between(year, beg_yr, end_yr)) %>%
+    mutate(price = mean(mean_price)) %>%
+    ggplot(aes(as.Date(final_date), price, color = price)) +
+    geom_line() +
+    scale_color_viridis(option = 'inferno') +
+    ggtitle(fuel_type) + xlab(NULL) + 
+    ylab(paste0('Price ', '(',df$measurement[df$product == fuel_type],')')) +
+    theme(legend.position = 'none') +
+    facet_wrap(~region)
+}
+
+# % change by state
+plot_pctInc <- function(date1, date2, fuel_type, area) {
+  df %>%
+    select(final_date, year, month, mean_price, product, region, state) %>%
+    group_by(product, region, state) %>%
+    filter(final_date == date1 | final_date == date2,
+           product == fuel_type, region == area) %>%
+    summarize(beg = mean_price[final_date == date1],
+              end = mean_price[final_date == date2],
+              pct_inc = (end - beg) / beg) %>%
+    ggplot(aes(reorder(state, pct_inc), pct_inc, fill = state)) +
+    geom_bar(color = 'black', stat = 'identity') +
+    scale_fill_viridis(option = 'inferno', discrete = TRUE) +
+    ggtitle(fuel_type) +
+    scale_x_discrete(name = NULL, labels = NULL) +
+    scale_y_continuous(name = '% Increase', labels = percent)
+}
+```
+
+
+The figures below illustrate the mean price of each fuel type over time. Note the price is calculated as an average of **all** observations in Brazil.
+```{r, echo = FALSE}
+grid.arrange(plot_byFuel('Common Gas', 2004, 2019), plot_byFuel('Ethanol', 2004, 2019),
+             plot_byFuel('Diesel', 2004, 2019), plot_byFuel('Diesel S10', 2004, 2019))
+```
+
+### A. Ethanol
+#### 1. Country-Wide
+Brazil ranks as the world's largest exporter of ethanol, and second largest producer of the fuel.  In 1976, the government mandated that gasoline consist of a certain percentage of ethanol, with the proportion lying around 25% in recent years.  Furthermore, flexible-fuel vehicles were made available to the public in 2003.  Capable of running on any gasoline to ethanol proportion, these vehicles have been dominating the automobile market since their introduction.  The combination of mandated ethanol proportions along with the popularity of flexible-fuel vehicels increased ethanol demand substantially.  However, the 2008 economic recession coupled with substandard sugarcane harvests and increased international sugar prices slowed the country's ethanol production from 2009 - 2013.
+
+```{r, echo = FALSE}
+plot_byFuel('Ethanol', 2005, 2013)
+```
+
+The figure above displays three separate price shocks, all of which resulting from domestic supply shortages. The first spike can be attributed to increased demand both domestic and abroad.  In Brazil, fuel proportion mandates and the rise of flexible-fuel vehicles made ethanol an attractive option to consumers.  Furthermore, ethanol exports to the United States went from US\$98 million in 2005 to US\$1 billion in 2006.  However, in 2007, these exports fell substantially due to increased ethanol production in the U.S.  With more ethanol to supply domestically, prices fell to their pre-2006 numbers.  A second spike occurred in 2009 on behalf of an extreme supply shortage.  First, the 2008 recession slowed production capacity, making it impossible to keep up with the continuing rise in demand from flexible-fuel vehicles.  Second, poor weather conditions led to substandard sugarcane harvests.  Lastly, high international sugar prices inclined producers to sell sugarcane as sugar rather than converting it to ethanol.  In early 2010, supply began catching up to domestic demand, with ethanol prices dropping below R\$2.00/l for the majority of the year.  However, another poor harvest season caused an additional supply shortage.  Brazil was forced to import ethanol from the United States, thus resulting in a third price spike.  In an attempt to stabilize prices, Brazil reduced the mandated ethanol proportion in April 2011, decreasing prices to ~R\$2.13/l.  Note that post-2013 fluctuations will be discussed in Sections B and C.  
+
+#### 2. By Region
+```{r, echo = FALSE}
+plot_byReg('Ethanol', 2005, 2013)
+```
+
+Prices in the North and Northeast are consistently higher than those in other regions, yet more stable during supply shortages.  I hypothesize they are consistently higher due to fuel transport costs, with the North and Northeast being furthest in proximity from the South.  In addition, prices likely remain stable during supply shortages with these regions having a lower demand than the South and Southeast.  The North, because of highway scarcity, and the Northeast, due to poverty levels.
+
+#### 3. 2009-2013 Supply Shortage: By State
+The following figure illustrates the percent increase in ethanol prices during the 2009-2013 supply shortages, by state.  The weeks ending in 1/10/09 and 1/4/14 serve as the "before" and "after" observations, respectively.  Precise values are included in a table below.
+```{r, echo = FALSE}
+selectInput('RegionA3', 'Select Region:',
+            list('North' = 'North', 'Northeast' = 'Northeast',
+                 'Central-West' = 'Central-West', 'South' = 'South',
+                 'Southeast' = 'Southeast'))
+```
+```{r, echo = FALSE}
+renderPlot(plot_pctInc('2009-01-10', '2014-01-04', 'Ethanol', input$RegionA3) +
+  labs(fill = 'State', caption = paste0(' % Increase in Prices: 1/10/09 - 1/4/14')))
+```
+```{r, echo = FALSE}
+# ethanol supply shortage table
+ess <- df %>%
+  select(final_date, year, month, mean_price, product, region, state) %>%
+  group_by(region, state) %>%
+  filter(final_date == '2009-01-10' | final_date == '2014-01-04',
+         product == 'Ethanol') %>%
+  mutate(beg = mean_price[final_date == '2009-01-10'],
+            end = mean_price[final_date == '2014-01-04'],
+            pct_inc = round(((end - beg) / beg) * 100, 2)) %>%
+  select(region, state, beg, end, pct_inc) %>%
+  arrange(desc(pct_inc)) %>%
+  distinct() %>%
+  rename('Region' = 'region', 'State' = 'state', 'Price Before' = 'beg',
+         'Price After' = 'end', '% Increase' = 'pct_inc') 
+datatable(ess)
+```
+
+Most states experience a 30-40% increase in prices over the time period, with Mato Grosso and São Paulo being affected the greatest.  Note São Paulo accounts for over half of the country's ethanol consumption.
+
+### B. Petrobras Scandal and 2014-2016 Economic Crisis
+#### 1. Country-Wide
+In mid-2014, a large-scale political corruption scandal involving Petrobras was brought to public attention.  The firm was charged with accepting millions of dollars in bribes from high-ranking politicians and legislators.  In addition, Brazil experienced a severe economic crisis from mid-2014 through 2016, with the country's GDP decreasing by 3.8% in 2015 and 3.6% in 2016.  The corruption scandal contributed to the recession, but faulty macroeconomic policy and a lackluster Chinese economy (Brazil's largest trade partner) can be cited as well.
+```{r, echo = FALSE}
+grid.arrange(plot_byFuel('Common Gas', 2014, 2016), plot_byFuel('Ethanol', 2014, 2016),
+             plot_byFuel('Diesel', 2014, 2016), plot_byFuel('Diesel S10', 2014, 2016))
+```
+
+Common gas, diesel, and diesel S10 prices rise slightly in late 2014, then sharply in early and late 2015.  With Petrobras deep in debt on behalf of the scandal, the government raised common gas, diesel, and diesel S10 prices in an attempt to aid the struggling company.  As a result, ethanol demand skyrocketed.  Coupled with high international sugar prices, this led to a spike of ~R\$0.75/l from late 2015 through early 2016.
+
+#### 2. By Region
+```{r, echo = FALSE}
+selectInput('FuelB2', 'Select Fuel Type:',
+            list('Common Gas' = 'Common Gas', 'Ethanol' = 'Ethanol',
+                 'Diesel' = 'Diesel', 'Diesel S10' = 'Diesel S10'))
+```
+```{r, echo = FALSE}
+renderPlot(plot_byReg(input$FuelB2, 2014, 2016))
+```
+
+Price trends for each fuel are fairly consistent throughout the recession.  However, note ethanol prices in the North during mid-2016.  Prices in the Central-West, Southeast, and South decrease substantially while those in the North remain relatively stable.  This can be attributed to tax changes in some of the region's states encouraging the use of ethanol over gasoline.  Hence, demand for the fuel remained high, with prices staying put.
+
+#### 3. Recession: By State
+The following figure illustrates the percent increase in fuel prices during the 2014-2016 economic crisis.  Precise values are included in a table below the figure.  The weeks ending in 1/14/14 and 12/31/16 serve as the "before" and "after" observations, respectively.  Note economic recovery began in early 2017.
+```{r, echo = FALSE}
+selectInput('FuelB3', 'Select Fuel Type:',
+            list('Common Gas' = 'Common Gas', 'Ethanol' = 'Ethanol',
+                 'Diesel' = 'Diesel', 'Diesel S10' = 'Diesel S10'))
+selectInput('RegionB3', 'Select Region:',
+            list('North' = 'North', 'Northeast' = 'Northeast',
+                 'Central-West' = 'Central-West', 'South' = 'South',
+                 'Southeast' = 'Southeast'))
+```
+```{r, echo = FALSE}
+renderPlot(plot_pctInc('2014-01-11', '2016-12-31', input$FuelB3, input$RegionB3) +
+  labs(fill = 'State', caption = paste0(' % Increase in Prices: 1/11/14 - 12/31/16')))
+```
+```{r, echo = FALSE}
+# recession table
+recession <- df %>%
+  select(final_date, year, month, mean_price, product, region, state) %>%
+  group_by(product, region, state) %>%
+  filter(final_date == '2014-01-11' | final_date == '2016-12-31') %>%
+  mutate(beg = mean_price[final_date == '2014-01-11'],
+         end = mean_price[final_date == '2016-12-31'],
+         pct_inc = round(((end - beg) / beg) * 100, 2)) %>%
+  select(product, region, state, beg, end, pct_inc) %>%
+  arrange(desc(pct_inc)) %>%
+  distinct() %>%
+  rename('Fuel Type' = 'product', 'Region' = 'region', 'State' = 'state', 'Price Before' = 'beg',
+         'Price After' = 'end', '% Increase' = 'pct_inc')
+datatable(recession)
+```
+
+Ethanol prices increase the greatest, most notably in the North.  More specifically, Amapa (North) experiences the third greatest increase in ethanol prices in addition to the greatest increase in diesel prices.
+
+### C. 2017 Fuel Tax Increase
+#### 1. Country-Wide
+On July 23, 2017, the government raised taxes on all fuel types in an attempt to lower the federal deficit.  The gasoline tax was raised from R\$0.3816/l to R\$0.7925/l, diesel from R\$0.2480/l to R\$0.4615/l, and ethanol from R\$0.12/l to R\$0.1309 for producers, and to R\$0.1494/l for distributors.
+```{r, echo = FALSE}
+grid.arrange(plot_byFuel('Common Gas', 2017, 2019), plot_byFuel('Ethanol', 2017, 2019),
+             plot_byFuel('Diesel', 2017, 2019), plot_byFuel('Diesel S10', 2017, 2019))
+```
+
+Fuel prices had been trending downward for the first half of 2017, rising sharply following the tax increases.  Although ethanol taxes were raised insignificantly in comparison, the fuel's price trend initially follows that of gasoline and diesel.  Much like the recession, the spike in gasoline and diesel prices increased the demand for ethanol, thus raising the price.  Soon after, a successful 2018 sugarcane harvest season encouraged an influx of ethanol production, exceeding demand and decreasing the price.
+
+#### 2. By Region
+```{r, echo = FALSE}
+selectInput('FuelC2', 'Select Fuel Type:',
+            list('Common Gas' = 'Common Gas', 'Ethanol' = 'Ethanol',
+                 'Diesel' = 'Diesel', 'Diesel S10' = 'Diesel S10'))
+```
+```{r, echo = FALSE}
+renderPlot(plot_byReg(input$FuelC2, 2017, 2019))
+```
+
+Note ethanol prices in the North and Northeast.  Again, prices remain high and relatively stable in the North  With state-specific taxes already favoring the fuel's consumption over gasoline, the region's ethanol demand was not heavily affected by the 2017 fuel taxes.  In the Northeast, prices decline slightly through mid-2017, though not to the extent of the Central-West, Southeast, and South.  In addition, prices through 2019 have increased substantially in comparison to other regions.  The Northeast is known for importing the greatest amount of U.S. corn-produced ethanol.  Hence, the recent increase in U.S. corn prices likely explains this discrepancy.
+
+#### 3. By State
+The following figure illustrates the percent increase in prices following the fuel tax, by state.  The weeks ending in 7/22/17 and 6/1/19 serve as the "before" and "after" observations, respectively.
+```{r, echo = FALSE}
+selectInput('FuelC3', 'Select Fuel Type:',
+            list('Common Gas' = 'Common Gas', 'Ethanol' = 'Ethanol',
+                 'Diesel' = 'Diesel', 'Diesel S10' = 'Diesel S10'))
+selectInput('RegionC3', 'Select Region:',
+            list('North' = 'North', 'Northeast' = 'Northeast',
+                 'Central-West' = 'Central-West', 'South' = 'South',
+                 'Southeast' = 'Southeast'))
+```
+```{r, echo = FALSE}
+renderPlot(plot_pctInc('2017-07-22', '2019-06-01', input$FuelC3, input$RegionC3) +
+  labs(fill = 'State', caption = paste0(' % Increase in Prices: 7/22/17 - 6/1/19')))
+```
+```{r, echo = FALSE}
+# post tax table
+post_tax <- df %>%
+  select(final_date, year, month, mean_price, product, region, state) %>%
+  group_by(product, region, state) %>%
+  filter(final_date == '2017-07-22' | final_date == '2019-06-01') %>%
+  mutate(beg = mean_price[final_date == '2017-07-22'],
+         end = mean_price[final_date == '2019-06-01'],
+         pct_inc = round(((end - beg) / beg) * 100, 2)) %>%
+  select(product, region, state, beg, end, pct_inc) %>%
+  arrange(desc(pct_inc)) %>%
+  distinct() %>%
+  rename('Fuel Type' = 'product', 'Region' = 'region', 'State' = 'state', 'Price Before' = 'beg',
+         'Price After' = 'end', '% Increase' = 'pct_inc') 
+datatable(post_tax)
+```
+State-specific analysis supports Section C2's findings.
+
+## IV. Model
+First, note the latest Brazilian and Chinese GDP data is from December 2018.  Thus, price models will be limited to May 2004 - December 2018 observations.  The remaining data is split into a training and testing set, having 55,936 (80%) and 13,982 (20%) observations, respectively.
+
+```{r}
+# Model to predict stock prices
+model <- df %>%
+  select(final_date, state, product, mean_price, month, year, b_gdp, c_gdp,
+         stock_price, wti_price, brent_price, sugar_price) %>%
+  group_by(state, product) %>%
+  filter(year <= 2018) %>%
+  dummy_cols(select_columns = c('state', 'product'), remove_first_dummy = TRUE)
+
+# Create partition, train/test sets
+partition <- createDataPartition(model$mean_price, p = 0.8,  list = FALSE)
+bgpTrain <- model[partition,]
+bgpTest  <- model[-partition,]
+```
+I construct two models in an attempt to predict fuel prices.  First, a bootstrapped linear regression with 25 repetitions, and second, a generalized linear model using regularization.  The second model uses 10-fold cross validation to find the best tuning parameters via lowest RMSE.  Both models account for oil, sugar, and Petrobras stock prices, Brazilian and Chinese GDP, fuel type, state fixed effects, and (year * month) fixed effects.  Summary statistics on the first model are included at the end of the report.
+
+```{r}
+# Bootstrapped linear regression
+set.seed(540)
+lm1 <- train(mean_price ~. - final_date - state - product - mean_price + (year * month) +
+               (stock_price * b_gdp * c_gdp * wti_price * brent_price * sugar_price),
+          data = bgpTrain, method = 'lm')
+
+# Regularization using glmnet
+set.seed(540)
+fitControl <- trainControl(method = 'repeatedcv', number = 10, repeats = 10)
+glmnet1 <- train(mean_price ~. - final_date - state - product - mean_price + (year * month) +
+                   (stock_price * b_gdp * c_gdp * wti_price * brent_price * sugar_price),
+                 data = bgpTrain, method = 'glmnet', trControl = fitControl)
+```
+
+Bootstrapped Linear Regression
+------------------------------
+```{r, echo = FALSE}
+lm1_df <- data.frame(lm1$results)
+lm1_df$intercept <- NULL
+lm1_df <- round(lm1_df, 3)
+datatable(lm1_df)
+```
+
+Generalized Linear Model
+------------------------
+```{r, echo = FALSE}
+glm1_df <- data.frame(round(glmnet1$results, 3))
+datatable(glm1_df)
+```
+The bootstrapped linear regression model proves to be a better fit on the training data, having a lower RMSE and higher R^2^ than the best GLM (row 1).  In addition, the GLM's especially low regularization parameter indicates penalization of the explanatory variables has little, if any benefits.
+
+```{r, echo = FALSE}
+ggplot(glmnet1)
+```
+
+Each model's fit on the held out test set must still be considered.
+```{r}
+# Calculate rmse on held out test set
+lm1_pred <- predict(lm1, bgpTest)
+glm1_pred <- predict(glmnet1, bgpTest)
+
+rmse <- function(mod_pred) {
+  mod_rmse <- vector('double', length = nrow(bgpTest))
+  for (i in seq_along(mod_rmse)) {
+    mod_rmse[[i]] <- RMSE(mod_pred[[i]], bgpTest$mean_price[[i]])
+  }
+  rmse_var <- var(mod_rmse)
+  rmse_mean <- mean(mod_rmse)
+  paste0('RMSE Mean: ', round(rmse_mean, digits = 3), ', ',
+  'RMSE Variance: ', round(rmse_var, digits = 3))
+}
+```
+```{r}
+# Bootstrapped linear regression
+rmse(lm1_pred)
+# Glmnet
+rmse(glm1_pred)
+```
+With a lower RMSE mean and variance, the bootstrapped linear regression model proves to be a better fit on the test set as well.
+
+
+Bootstrapped Linear Regression: Summary Statistics
+--------------------------------------------------
+```{r, echo = FALSE}
+summary(lm1)
+```
+
+
+
